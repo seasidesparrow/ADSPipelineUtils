@@ -1,7 +1,7 @@
 adsmsg==1.3.0
 concurrent-log-handler==0.9.16
 python-dateutil==2.8.1
-DateTime==4.1.1
+DateTime>=4.1.1
 celery==4.4.2
 SQLAlchemy==1.3.16
 python-json-logger==0.1.8

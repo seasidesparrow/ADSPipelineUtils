@@ -381,14 +381,16 @@ class ADSCelery(Celery):
         self.exchange = Exchange(self._config.get('CELERY_DEFAULT_EXCHANGE', 'ads-pipeline'),
                 type=self._config.get('CELERY_DEFAULT_EXCHANGE_TYPE', 'topic'))
 
-        self.forwarding_connection = None
-        if self._config.get('OUTPUT_CELERY_BROKER', None):
-            # kombu connection is lazy loaded, so it's ok to create now
-            self.forwarding_connection = BrokerConnection(self._config['OUTPUT_CELERY_BROKER'])
+        self.forward_message_dict = {}
+        def setup_forward_message(output_celery_broker=None, output_taskname=None):
+            broker = output_celery_broker or self._config.get('OUTPUT_CELERY_BROKER')
 
-            if self.conf.get('OUTPUT_TASKNAME', None):
+            if broker:
+                task_name = output_taskname or self._config.get('OUTPUT_TASKNAME')
+                if not task_name:
+                    raise NotImplementedError('Sorry, your app is not properly configured (no task handler).')
 
-                @self.task(name=self._config['OUTPUT_TASKNAME'],
+                @self.task(name=task_name,
                            exchange=self._config.get('OUTPUT_EXCHANGE', 'ads-pipeline'),
                            queue=self._config.get('OUTPUT_QUEUE', 'update-record'),
                            routing_key=self._config.get('OUTPUT_QUEUE', 'update-record'))
@@ -397,7 +399,16 @@ class ADSCelery(Celery):
                     queue. It does nothing (it doesn't process data)"""
                     self.logger.error('We should have never been called directly! %s' % \
                                       (args, kwargs))
-                self._forward_message = _forward_message
+
+                return {'broker': broker, 'forward message': _forward_message}
+
+        if not self._config.get('FORWARD_MSG_DICT'):
+            self.forward_message_dict['default'] = setup_forward_message()
+        else:
+            for setup in self._config.get('FORWARD_MSG_DICT'):
+                if not setup.get('OUTPUT_PIPELINE') or not setup.get('OUTPUT_CELERY_BROKER') or not setup.get('OUTPUT_TASKNAME'):
+                    raise NotImplementedError('Sorry, your app is not properly configured (setup for multiple pipelines missing keys).')
+                self.forward_message_dict[setup.get('OUTPUT_PIPELINE')] = setup_forward_message(output_celery_broker=setup.get('OUTPUT_CELERY_BROKER'), output_taskname=setup.get('OUTPUT_TASKNAME'))
 
         # HTTP connection pool
         # - The maximum number of retries each connection should attempt: this
@@ -426,13 +437,31 @@ class ADSCelery(Celery):
 
     def forward_message(self, *args, **kwargs):
         """Class method that is replaced during initializiton with the real
-        implementation (IFF) the OUTPUT_TASKNAME and oother OUTPUT_ parameters
-        are specified."""
-        if not self.forwarding_connection or not self._forward_message:
+        implementation (IFF) the OUTPUT_TASKNAME and other OUTPUT_ parameters
+        are specified.
+
+        To set in config:
+        - For a single output destination:
+            - OUTPUT_CELERY_BROKER
+            - OUTPUT_TASKNAME
+            At call time:
+                self.forward_message(message)
+
+        - For multiple output destinations:
+            - FORWARD_MSG_DICT = [{OUTPUT_PIPELINE: , OUTPUT_CELERY_BROKER: , OUTPUT_TASKNAME: }, ...]
+            where OUTPUT_PIPELINE is a string that will need to be specified in the call to forward_message as:
+                self.forward_message(message, pipeline=OUTPUT_PIPELINE)
+        """
+        pipeline = kwargs.get('pipeline', 'default')
+
+        if self.forward_message_dict and pipeline:
+            if not self.forward_message_dict[pipeline].get('broker'):
+                raise NotImplementedError('Sorry, your app is not properly configured (no broker).')
+            forwarding_connection = BrokerConnection(self.forward_message_dict[pipeline].get('broker'))
+            self.logger.debug('Forwarding results out to: %s', self.forward_message_dict[pipeline].get('broker'))
+            return self.forward_message_dict[pipeline]['forward message'].apply_async(args, kwargs, connection=forwarding_connection)
+        else:
             raise NotImplementedError('Sorry, your app is not properly configured.')
-        self.logger.debug('Forwarding results out to: %s', self.forwarding_connection)
-        return self._forward_message.apply_async(args, kwargs,
-                                                 connection=self.forwarding_connection)
 
     def _get_callers_module(self):
         frame = inspect.stack()[2]
